@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hydranten-Quelle für die Relaisleitung (FF St. Johann im Ahrntal)
+"""Hydranten-Quelle für die Relaisleitung
 
 Lädt OpenStreetMap-Auszüge von Geofabrik, filtert Hydranten, Saugstellen,
 Löschwasserbehälter und Löschteiche heraus und schreibt sie als Kacheln
