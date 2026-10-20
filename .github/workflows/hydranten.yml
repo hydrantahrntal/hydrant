@@ -1,0 +1,78 @@
+# Hydranten-Quelle für die Relaisleitung
+# Läuft jeden Montag früh (und von Hand über "Run workflow"):
+# Geofabrik-Auszüge laden → Hydranten, Saugstellen, Löschwasserbehälter, Löschteiche filtern
+# → Kacheln auf GitHub Pages veröffentlichen. Zusätzlich landet der Stand im Zweig "daten";
+# das hält das Repository aktiv (sonst schaltet GitHub zeitgesteuerte Läufe nach 60 Tagen ab)
+# und dient beim nächsten Lauf als Vergleich.
+name: Hydranten aktualisieren
+
+on:
+  schedule:
+    - cron: '37 3 * * 1'   # Montag 03:37 UTC
+  workflow_dispatch:
+    inputs:
+      ohne_vergleich:
+        description: 'Auch veröffentlichen, wenn deutlich weniger Einträge als beim letzten Lauf herauskommen'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # Zweig "daten" schreiben
+  pages: write
+  id-token: write
+
+concurrency:
+  group: hydranten
+  cancel-in-progress: false
+
+jobs:
+  hydranten:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq osmium-tool
+          python3 -m pip install --quiet --break-system-packages shapely
+
+      - name: Letzten Stand zum Vergleich holen
+        run: |
+          if git fetch --quiet --depth=1 origin daten; then
+            git show FETCH_HEAD:index.json > vorher.json || true
+          else
+            echo "Noch kein früherer Stand."
+          fi
+
+      - name: Hydranten filtern und Kacheln erzeugen
+        env:
+          OHNE_VERGLEICH: ${{ inputs.ohne_vergleich }}
+        run: |
+          if [ "$OHNE_VERGLEICH" = "true" ]; then MIN=0; else MIN=0.7; fi
+          python3 werkzeug/hydranten.py --ziel site --vorher vorher.json --min-anteil "$MIN"
+
+      - name: Stand im Zweig "daten" ablegen
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd site
+          git init --quiet -b daten
+          git add -A
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "Hydranten, Stand $(python3 -c 'import json;print(json.load(open("index.json"))["stand"])')"
+          git push --quiet --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" daten
+          rm -rf .git
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5
