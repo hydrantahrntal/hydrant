@@ -11,9 +11,14 @@ für GitHub Pages:
   index.html        kurze Übersicht zum Nachschauen im Browser
 
 Kilometersteine (seit 11/2026, für die Karte im Whiteboard): je Kachel
-{"km": [[Breite, Länge, Kilometer, Straße, OSM-Id], …]}. Kilometer ist eine
-Zahl (22.5), Straße die Nummer der Straße, auf der der Stein als Punkt liegt
-(z. B. "SS621"), sonst die Angabe am Stein selbst oder "". In index.json steht
+{"km": [[Breite, Länge, Kilometer, Straße, Id, Quelle], …]}. Kilometer ist eine
+Zahl (22.5), Straße die Straßennummer ohne Leerzeichen und Punkte (z. B.
+"SS621"). Quelle "bz" = Straßendienst des Landes Südtirol (Datensatz
+"Kilometersteine – Cippi chilometrici", CC0, WFS p_bz-TransportNetwork:
+Signs-Milestones; nur Staats-/Landesstraßen und Autobahn), "osm" =
+OpenStreetMap (highway=milestone; Straße = Nummer der Straße, auf der der Stein
+als Punkt liegt, sonst die Angabe am Stein). Wo das Land einen Stein hat, fallen
+OSM-Steine mit demselben Kilometer im Umkreis von 300 m weg. In index.json steht
 unter "km" die Anzahl je Kachel; die Abdeckung ("c") gilt wie für Hydranten.
 
 Kachel i_j deckt Breite i·0,25 … (i+1)·0,25 und Länge j·0,25 … (j+1)·0,25 ab.
@@ -57,6 +62,11 @@ KM_STRASSEN = ('motorway,motorway_link,trunk,trunk_link,primary,primary_link,sec
                'tertiary,tertiary_link,unclassified,residential,service,track')
 KM_RANG = {k: i for i, k in enumerate(['motorway', 'trunk', 'primary', 'secondary', 'tertiary'])}
 LIZENZ = '© OpenStreetMap-Mitwirkende, Open Database License (ODbL) 1.0'
+LIZENZ_KM = 'Kilometersteine in Südtirol: Autonome Provinz Bozen – Südtirol, Straßendienst (CC0)'
+# Kilometersteine des Landes Südtirol (Open Data, CC0)
+LANDES_WFS = 'https://geoservices1.civis.bz.it/geoserver/p_bz-TransportNetwork/ows'
+LANDES_TYP = 'p_bz-TransportNetwork:Signs-Milestones'
+LANDES_ARTEN = {1, 2}   # 1 Staats-/Landesstraße, 2 Autobahn (3 Gewässer, 4 Radroute nicht)
 
 
 def log(*a):
@@ -245,6 +255,138 @@ def km_einlesen(steine_xml, strassen_xml, km):
     return len(neu)
 
 
+def utm32_wgs84(x, y):
+    """ETRS89 / UTM 32N (EPSG:25832) → (Breite, Länge) in Grad; Genauigkeit weit unter 1 m."""
+    a, f, k0 = 6378137.0, 1 / 298.257222101, 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+    x -= 500000.0
+    m = y / k0
+    mu = m / (a * (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256))
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    p1 = (mu + (3 * e1 / 2 - 27 * e1 ** 3 / 32) * math.sin(2 * mu)
+          + (21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32) * math.sin(4 * mu)
+          + (151 * e1 ** 3 / 96) * math.sin(6 * mu) + (1097 * e1 ** 4 / 512) * math.sin(8 * mu))
+    s1, c1 = math.sin(p1), math.cos(p1)
+    t1 = math.tan(p1) ** 2
+    n1 = a / math.sqrt(1 - e2 * s1 ** 2)
+    r1 = a * (1 - e2) / (1 - e2 * s1 ** 2) ** 1.5
+    cc = ep2 * c1 ** 2
+    d = x / (n1 * k0)
+    lat = p1 - (n1 * math.tan(p1) / r1) * (d ** 2 / 2 - (5 + 3 * t1 + 10 * cc - 4 * cc ** 2 - 9 * ep2) * d ** 4 / 24
+                                           + (61 + 90 * t1 + 298 * cc + 45 * t1 ** 2 - 252 * ep2 - 3 * cc ** 2) * d ** 6 / 720)
+    lon = (d - (1 + 2 * t1 + cc) * d ** 3 / 6 + (5 - 2 * cc + 28 * t1 - 3 * cc ** 2 + 8 * ep2 + 24 * t1 ** 2) * d ** 5 / 120) / c1
+    return math.degrees(lat), 9.0 + math.degrees(lon)
+
+
+def landes_km_laden(ziel_json):
+    """Alle Kilometersteine vom WFS des Landes in eine Datei (seitenweise)."""
+    basis = f'{LANDES_WFS}?service=WFS&version=2.0.0&request=GetFeature&typeNames={LANDES_TYP}&outputFormat=application/json'
+    teil = ziel_json + '.teil'
+
+    def holen(url):
+        laden(url, teil, versuche=3)
+        with open(teil, encoding='utf-8') as f:
+            j = json.load(f)
+        os.remove(teil)
+        if not isinstance(j.get('features'), list):
+            raise ValueError('keine features in der Antwort')
+        return j['features']
+
+    alle, start, seite = [], 0, 50000
+    try:
+        while True:   # seitenweise, sortiert nach ID
+            feats = holen(f'{basis}&count={seite}&startIndex={start}&sortBy=ID')
+            alle.extend(feats)
+            log(f'  Land: {len(alle)} Steine geladen')
+            if len(feats) < seite or start > 1000000:
+                break
+            start += seite
+    except Exception as e:  # noqa: BLE001
+        if alle:
+            raise
+        log(f'  Seitenweise Abfrage fehlgeschlagen ({e}) – alles auf einmal')
+        alle = holen(basis)
+        log(f'  Land: {len(alle)} Steine geladen')
+    with open(ziel_json, 'w', encoding='utf-8') as f:
+        json.dump({'features': alle}, f)
+
+
+def landes_km_einlesen(pfad):
+    """Landesdaten → Liste [Breite, Länge, Kilometer, Straße, Id, 'bz'] (nur Straßen und Autobahn)."""
+    with open(pfad, encoding='utf-8') as f:
+        feats = json.load(f).get('features') or []
+    out, arten = [], {}
+    for ft in feats:
+        pr = ft.get('properties') or {}
+        try:
+            art = int(pr.get('TYPE_CODE'))
+        except (TypeError, ValueError):
+            art = None
+        arten[art] = arten.get(art, 0) + 1
+        if art not in LANDES_ARTEN:
+            continue
+        d = pr.get('POS_KM')
+        if d is None and pr.get('POS_M') is not None:
+            d = float(pr['POS_M']) / 1000
+        try:
+            d = round(float(d), 3)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= d < 10000:
+            continue
+        lat = lon = None
+        try:   # amtliche Koordinaten (UTM 32N, cm-genau) – die Geometrie des Dienstes ist gerundet
+            x, y = float(pr['COORD_X']), float(pr['COORD_Y'])
+            if 200000 < x < 900000 and 4000000 < y < 6000000:
+                lat, lon = utm32_wgs84(x, y)
+        except (KeyError, TypeError, ValueError):
+            pass
+        if lat is None:
+            c = ((ft.get('geometry') or {}).get('coordinates') or [None, None])
+            try:
+                a, b = float(c[0]), float(c[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if 40 < a < 50 and 5 < b < 20:
+                a, b = b, a   # Achsen vertauscht
+            if not (5 < a < 20 and 40 < b < 50):
+                continue
+            lon, lat = a, b
+        ref = str(pr.get('ROAD_CODE_DE') or pr.get('ROAD_CODE_IT') or '').replace('.', '').replace(' ', '')
+        oid = pr.get('ID', ft.get('id'))
+        out.append([round(lat, 7), round(lon, 7), d, ref, f'bz{oid}', 'bz'])
+    log(f'  Land: Arten {dict(sorted(arten.items(), key=lambda kv: str(kv[0])))}, davon {len(out)} Straßen-/Autobahnsteine')
+    return out
+
+
+def km_zusammen(km_osm, landes):
+    """Landessteine haben Vorrang: OSM-Steine mit gleichem Kilometer im Umkreis von 300 m fallen weg."""
+    if not landes:
+        return [st + ['osm'] for st in km_osm.values()]
+    raster = {}
+    for st in landes:
+        raster.setdefault((round(st[0] / 0.01), round(st[1] / 0.01)), []).append(st)
+    out, weg = list(landes), 0
+    for st in km_osm.values():
+        gi, gj = round(st[0] / 0.01), round(st[1] / 0.01)
+        doppelt = False
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for l in raster.get((gi + di, gj + dj), ()):
+                    if abs(l[2] - st[2]) < 0.001:
+                        dy = (l[0] - st[0]) * 111320
+                        dx = (l[1] - st[1]) * 111320 * math.cos(math.radians(st[0]))
+                        if dx * dx + dy * dy < 300 ** 2:
+                            doppelt = True
+        if doppelt:
+            weg += 1
+        else:
+            out.append(st + ['osm'])
+    log(f'Kilometersteine: {len(landes)} vom Land, {len(km_osm) - weg} aus OpenStreetMap ({weg} doppelte OSM-Steine weggelassen)')
+    return out
+
+
 def einlesen(osm_xml, elemente):
     """Gefilterte OSM-XML-Datei → Einträge im Overpass-Format (mit center für Flächen)."""
     knoten, wege, rel = {}, {}, []
@@ -311,7 +453,8 @@ def html_seite(idx):
     zeilen = ''.join(f'<tr><td>{k}</td><td>{zahl(v)}</td></tr>' for k, v in [
         ('Hydranten', arten.get('hydrant', 0)), ('Saugstellen', arten.get('suction', 0)),
         ('Löschwasserbehälter', arten.get('tank', 0)), ('Löschteiche', arten.get('pond', 0)),
-        ('Kilometersteine', sum((idx.get('km') or {}).values()))])
+        ('Kilometersteine', sum((idx.get('km') or {}).values())),
+        ('davon vom Land Südtirol', (idx.get('km_quellen') or {}).get('bz', 0))])
     stand = ', '.join(f'{r}: {t[:10]}' for r, t in idx['regionen'].items())
     erzeugt = idx['erzeugt'][:16].replace('T', ' ')
     return f'''<!doctype html>
@@ -324,7 +467,7 @@ small{{color:#5b6573}}</style></head><body>
 <p>Stand der Daten: <b>{idx["stand"][:10]}</b> ({stand})<br>Erzeugt: {erzeugt} UTC</p>
 <table>{zeilen}</table>
 <p>{zahl(idx["anzahl"])} Einträge in {zahl(len(idx["kacheln"]))} Kacheln.</p>
-<p><small>Daten: {LIZENZ}. Gefiltert aus den Auszügen von Geofabrik. Die Relaisleitung lädt <code>index.json</code> und die Kacheln unter <code>k/</code>, das Whiteboard zusätzlich die Kilometersteine unter <code>km/</code>.</small></p>
+<p><small>Daten: {LIZENZ}. {LIZENZ_KM}. Gefiltert aus den Auszügen von Geofabrik. Die Relaisleitung lädt <code>index.json</code> und die Kacheln unter <code>k/</code>, das Whiteboard zusätzlich die Kilometersteine unter <code>km/</code>.</small></p>
 </body></html>
 '''
 
@@ -334,8 +477,9 @@ def schreiben(ziel, elemente, abdeck, regionen, km=None):
         shutil.rmtree(ziel)
     os.makedirs(os.path.join(ziel, 'k'))
     os.makedirs(os.path.join(ziel, 'km'))
-    km_gruppen = {}
-    for st in (km or {}).values():
+    km_gruppen, km_quellen = {}, {}
+    for st in (km or []):
+        km_quellen[st[5]] = km_quellen.get(st[5], 0) + 1
         km_gruppen.setdefault((math.floor(st[0] / KACHEL), math.floor(st[1] / KACHEL)), []).append(st)
     km_index = {}
     gruppen = {}
@@ -351,10 +495,10 @@ def schreiben(ziel, elemente, abdeck, regionen, km=None):
             with open(os.path.join(ziel, 'k', f'{i}_{j}.json'), 'w', encoding='utf-8') as f:
                 json.dump({'elements': els}, f, ensure_ascii=False, separators=(',', ':'))
         kacheln[f'{i}_{j}'] = eintrag
-        steine = sorted(km_gruppen.get((i, j), []), key=lambda st: st[4])
+        steine = sorted(km_gruppen.get((i, j), []), key=lambda st: (st[3], st[2], str(st[4])))
         if steine:
             with open(os.path.join(ziel, 'km', f'{i}_{j}.json'), 'w', encoding='utf-8') as f:
-                json.dump({'km': [[st[0], st[1], int(st[2]) if st[2] == int(st[2]) else st[2], st[3], st[4]]
+                json.dump({'km': [[st[0], st[1], int(st[2]) if st[2] == int(st[2]) else st[2], st[3], st[4], st[5]]
                                   for st in steine]}, f, ensure_ascii=False, separators=(',', ':'))
             km_index[f'{i}_{j}'] = len(steine)
         for e in els:
@@ -372,6 +516,8 @@ def schreiben(ziel, elemente, abdeck, regionen, km=None):
         'lizenz': LIZENZ,
         'kacheln': kacheln,
         'km': km_index,
+        'km_quellen': km_quellen,
+        'lizenz_km': LIZENZ_KM,
     }
     with open(os.path.join(ziel, 'index.json'), 'w', encoding='utf-8') as f:
         json.dump(idx, f, ensure_ascii=False, separators=(',', ':'))
@@ -405,6 +551,8 @@ def main():
     ap.add_argument('--lokal', help='Ordner mit bereits geladenen <name>-latest.osm.pbf und <name>.poly (zum Testen)')
     ap.add_argument('--vorher', help='index.json des letzten Laufs zum Vergleich')
     ap.add_argument('--min-anteil', type=float, default=0.7, help='Abbruch unter diesem Anteil des letzten Stands')
+    ap.add_argument('--landes-datei', help='Kilometersteine des Landes aus dieser GeoJSON-Datei statt vom WFS (zum Testen)')
+    ap.add_argument('--ohne-land', action='store_true', help='Kilometersteine des Landes weglassen')
     a = ap.parse_args()
 
     arbeit = tempfile.mkdtemp(prefix='hydranten-')
@@ -429,8 +577,20 @@ def main():
         log(f'{region}: Stand {regionen[region]}, {len(elemente) - vorher} neue Einträge')
         if not a.lokal:
             os.remove(pbf)
+    landes = []
+    if not a.ohne_land:
+        try:
+            pfad = a.landes_datei
+            if not pfad:
+                log('Lade Kilometersteine des Landes Südtirol …')
+                pfad = os.path.join(arbeit, 'land-km.json')
+                landes_km_laden(pfad)
+            landes = landes_km_einlesen(pfad)
+        except Exception as e:  # noqa: BLE001 – ohne Landesdaten weiter, nur OSM
+            log(f'WARNUNG: Kilometersteine des Landes nicht geladen ({e}) – nur OpenStreetMap.')
+    km_liste = km_zusammen(km, landes)
     abdeck = abdeckung(unary_union(flaechen))
-    idx = schreiben(a.ziel, elemente, abdeck, regionen, km)
+    idx = schreiben(a.ziel, elemente, abdeck, regionen, km_liste)
     if idx['anzahl'] == 0:
         raise SystemExit('Abbruch: keine Einträge gefunden.')
     log(f'{idx["anzahl"]} Einträge in {len(idx["kacheln"])} Kacheln, Arten: {idx["arten"]}, '
