@@ -7,7 +7,14 @@ für GitHub Pages:
 
   index.json        Stand, Anzahl, Kachelliste mit Abdeckung je Rasterzelle
   k/<i>_<j>.json    Einträge einer Kachel (0,25° × 0,25°) im Overpass-Format
+  km/<i>_<j>.json   Kilometersteine (highway=milestone) derselben Kachel
   index.html        kurze Übersicht zum Nachschauen im Browser
+
+Kilometersteine (seit 11/2026, für die Karte im Whiteboard): je Kachel
+{"km": [[Breite, Länge, Kilometer, Straße, OSM-Id], …]}. Kilometer ist eine
+Zahl (22.5), Straße die Nummer der Straße, auf der der Stein als Punkt liegt
+(z. B. "SS621"), sonst die Angabe am Stein selbst oder "". In index.json steht
+unter "km" die Anzahl je Kachel; die Abdeckung ("c") gilt wie für Hydranten.
 
 Kachel i_j deckt Breite i·0,25 … (i+1)·0,25 und Länge j·0,25 … (j+1)·0,25 ab.
 Jede Kachel besteht aus 5 × 5 Rasterzellen zu 0,05° (dasselbe Raster wie in
@@ -45,6 +52,10 @@ EPS = 1e-6
 ARTEN = {'fire_hydrant': 'hydrant', 'suction_point': 'suction', 'water_tank': 'tank', 'fire_water_pond': 'pond'}
 NUR_PUNKTE = {'fire_hydrant'}  # wie die Overpass-Abfrage: Hydranten nur als Punkt
 FORMAT = 'relaisleitung-hydranten-quelle'
+# Straßen, deren Nummer ein Kilometerstein übernimmt (wenn er als Punkt auf ihr liegt)
+KM_STRASSEN = ('motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,'
+               'tertiary,tertiary_link,unclassified,residential,service,track')
+KM_RANG = {k: i for i, k in enumerate(['motorway', 'trunk', 'primary', 'secondary', 'tertiary'])}
 LIZENZ = '© OpenStreetMap-Mitwirkende, Open Database License (ODbL) 1.0'
 
 
@@ -171,6 +182,69 @@ def filtern(pbf, ziel):
                     '-o', ziel, '--overwrite', '--no-progress'], check=True)
 
 
+def km_filtern(pbf, steine, strassen):
+    """Kilometersteine und die Straßen (ohne Punkte), auf denen sie liegen könnten."""
+    subprocess.run(['osmium', 'tags-filter', pbf, 'n/highway=milestone',
+                    '-o', steine, '--overwrite', '--no-progress'], check=True)
+    subprocess.run(['osmium', 'tags-filter', pbf, 'w/highway=' + KM_STRASSEN, '-R',
+                    '-o', strassen, '--overwrite', '--no-progress'], check=True)
+
+
+def km_zahl(text):
+    """'23' / '22,5' / 'km 23.5' / '23 km' → 23.0 / 22.5 / 23.5; sonst None."""
+    if not text:
+        return None
+    t = text.strip().lower().replace('km', '').replace(',', '.').strip()
+    if '+' in t:  # 23+500
+        a, _, b = t.partition('+')
+        try:
+            return round(float(a) + float(b) / 1000, 3)
+        except ValueError:
+            return None
+    try:
+        z = float(t)
+    except ValueError:
+        return None
+    return round(z, 3) if 0 <= z < 10000 else None
+
+
+def km_einlesen(steine_xml, strassen_xml, km):
+    """Kilometersteine → km[id] = [Breite, Länge, Kilometer, Straße, id]."""
+    neu = {}
+    for _, el in ET.iterparse(steine_xml, events=('end',)):
+        if el.tag != 'node':
+            continue
+        tags = {t.get('k'): t.get('v') for t in el.findall('tag')}
+        if tags.get('highway') == 'milestone' and el.get('lat') is not None:
+            d = km_zahl(tags.get('distance') or tags.get('pk') or tags.get('ele:km'))
+            if d is not None:
+                ref = tags.get('highway:ref') or tags.get('road') or tags.get('ref') or ''
+                oid = int(el.get('id'))
+                neu[oid] = [round(float(el.get('lat')), 7), round(float(el.get('lon')), 7), d, ref, oid]
+        el.clear()
+    if neu:
+        bester = {}  # Stein-Id → (Rang, Nummer)
+        for _, el in ET.iterparse(strassen_xml, events=('end',)):
+            if el.tag != 'way':
+                continue
+            treffer = [int(nd.get('ref')) for nd in el.findall('nd') if int(nd.get('ref')) in neu]
+            if treffer:
+                tags = {t.get('k'): t.get('v') for t in el.findall('tag')}
+                ref = (tags.get('ref') or '').split(';')[0].strip()
+                if ref:
+                    rang = KM_RANG.get(tags.get('highway', '').replace('_link', ''), 9)
+                    for oid in treffer:
+                        if oid not in bester or rang < bester[oid][0]:
+                            bester[oid] = (rang, ref)
+            el.clear()
+        for oid, (_, ref) in bester.items():
+            neu[oid][3] = ref
+    for st in neu.values():
+        st[3] = st[3].replace(' ', '')
+    km.update(neu)
+    return len(neu)
+
+
 def einlesen(osm_xml, elemente):
     """Gefilterte OSM-XML-Datei → Einträge im Overpass-Format (mit center für Flächen)."""
     knoten, wege, rel = {}, {}, []
@@ -236,7 +310,8 @@ def html_seite(idx):
     arten = idx['arten']
     zeilen = ''.join(f'<tr><td>{k}</td><td>{zahl(v)}</td></tr>' for k, v in [
         ('Hydranten', arten.get('hydrant', 0)), ('Saugstellen', arten.get('suction', 0)),
-        ('Löschwasserbehälter', arten.get('tank', 0)), ('Löschteiche', arten.get('pond', 0))])
+        ('Löschwasserbehälter', arten.get('tank', 0)), ('Löschteiche', arten.get('pond', 0)),
+        ('Kilometersteine', sum((idx.get('km') or {}).values()))])
     stand = ', '.join(f'{r}: {t[:10]}' for r, t in idx['regionen'].items())
     erzeugt = idx['erzeugt'][:16].replace('T', ' ')
     return f'''<!doctype html>
@@ -249,15 +324,20 @@ small{{color:#5b6573}}</style></head><body>
 <p>Stand der Daten: <b>{idx["stand"][:10]}</b> ({stand})<br>Erzeugt: {erzeugt} UTC</p>
 <table>{zeilen}</table>
 <p>{zahl(idx["anzahl"])} Einträge in {zahl(len(idx["kacheln"]))} Kacheln.</p>
-<p><small>Daten: {LIZENZ}. Gefiltert aus den Auszügen von Geofabrik. Die Relaisleitung lädt <code>index.json</code> und die Kacheln unter <code>k/</code>.</small></p>
+<p><small>Daten: {LIZENZ}. Gefiltert aus den Auszügen von Geofabrik. Die Relaisleitung lädt <code>index.json</code> und die Kacheln unter <code>k/</code>, das Whiteboard zusätzlich die Kilometersteine unter <code>km/</code>.</small></p>
 </body></html>
 '''
 
 
-def schreiben(ziel, elemente, abdeck, regionen):
+def schreiben(ziel, elemente, abdeck, regionen, km=None):
     if os.path.isdir(ziel):
         shutil.rmtree(ziel)
     os.makedirs(os.path.join(ziel, 'k'))
+    os.makedirs(os.path.join(ziel, 'km'))
+    km_gruppen = {}
+    for st in (km or {}).values():
+        km_gruppen.setdefault((math.floor(st[0] / KACHEL), math.floor(st[1] / KACHEL)), []).append(st)
+    km_index = {}
     gruppen = {}
     for el in elemente.values():
         la, lo = lage(el)
@@ -271,6 +351,12 @@ def schreiben(ziel, elemente, abdeck, regionen):
             with open(os.path.join(ziel, 'k', f'{i}_{j}.json'), 'w', encoding='utf-8') as f:
                 json.dump({'elements': els}, f, ensure_ascii=False, separators=(',', ':'))
         kacheln[f'{i}_{j}'] = eintrag
+        steine = sorted(km_gruppen.get((i, j), []), key=lambda st: st[4])
+        if steine:
+            with open(os.path.join(ziel, 'km', f'{i}_{j}.json'), 'w', encoding='utf-8') as f:
+                json.dump({'km': [[st[0], st[1], int(st[2]) if st[2] == int(st[2]) else st[2], st[3], st[4]]
+                                  for st in steine]}, f, ensure_ascii=False, separators=(',', ':'))
+            km_index[f'{i}_{j}'] = len(steine)
         for e in els:
             a = ARTEN[e['tags']['emergency']]
             arten[a] = arten.get(a, 0) + 1
@@ -285,6 +371,7 @@ def schreiben(ziel, elemente, abdeck, regionen):
         'arten': arten,
         'lizenz': LIZENZ,
         'kacheln': kacheln,
+        'km': km_index,
     }
     with open(os.path.join(ziel, 'index.json'), 'w', encoding='utf-8') as f:
         json.dump(idx, f, ensure_ascii=False, separators=(',', ':'))
@@ -321,7 +408,7 @@ def main():
     a = ap.parse_args()
 
     arbeit = tempfile.mkdtemp(prefix='hydranten-')
-    elemente, flaechen, regionen = {}, [], {}
+    elemente, flaechen, regionen, km = {}, [], {}, {}
     for region in a.regionen:
         name = region.rsplit('/', 1)[-1]
         if a.lokal:
@@ -334,15 +421,20 @@ def main():
         filtern(pbf, gefiltert)
         vorher = len(elemente)
         einlesen(gefiltert, elemente)
+        steine, strassen = os.path.join(arbeit, f'{name}-km.osm'), os.path.join(arbeit, f'{name}-str.osm')
+        km_filtern(pbf, steine, strassen)
+        log(f'{region}: {km_einlesen(steine, strassen, km)} Kilometersteine')
+        os.remove(strassen)
         flaechen.append(poly_lesen(poly))
         log(f'{region}: Stand {regionen[region]}, {len(elemente) - vorher} neue Einträge')
         if not a.lokal:
             os.remove(pbf)
     abdeck = abdeckung(unary_union(flaechen))
-    idx = schreiben(a.ziel, elemente, abdeck, regionen)
+    idx = schreiben(a.ziel, elemente, abdeck, regionen, km)
     if idx['anzahl'] == 0:
         raise SystemExit('Abbruch: keine Einträge gefunden.')
-    log(f'{idx["anzahl"]} Einträge in {len(idx["kacheln"])} Kacheln, Arten: {idx["arten"]}')
+    log(f'{idx["anzahl"]} Einträge in {len(idx["kacheln"])} Kacheln, Arten: {idx["arten"]}, '
+        f'Kilometersteine: {sum(idx["km"].values())}')
     ausserhalb = len(elemente) - idx['anzahl']
     if ausserhalb:
         log(f'({ausserhalb} Einträge liegen in Kacheln ohne ganz abgedeckte Zelle und werden nicht veröffentlicht)')
